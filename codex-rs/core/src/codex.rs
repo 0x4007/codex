@@ -1774,6 +1774,16 @@ async fn spawn_review_thread(
 /// basis, the source URL, the recorded revision/date, the response-body digest
 /// and the docs-schema route/digest. It carries no rate, no invoice and no
 /// savings claim.
+/// Minimum cacheable prompt prefix for the GPT-5.6 family, from OpenAI's own
+/// documentation rather than a guess: "The minimum cacheable prompt length is
+/// 1,024 tokens for GPT-5.6 and later", and "Tokens in the OpenAI-provided
+/// hidden system content do not count toward this minimum"
+/// (https://platform.openai.com/docs/guides/prompt-caching).
+///
+/// Recorded with its provenance so the value is auditable and can be revised
+/// when upstream changes it; the selector never invents cache eligibility (I10).
+const LUNA_MIN_CACHEABLE_PREFIX_TOKENS: u64 = 1_024;
+
 const LUNA_REFERENCE_PRICE_SOURCE: &str = concat!(
     "basis=openrouter_reference_list not_uos_invoice ",
     "url=https://openrouter.ai/api/v1/models ",
@@ -1827,13 +1837,13 @@ fn recorded_pricing_catalog(model: &str) -> Option<working_set::PricingCatalog> 
             // row does not record whether internal reasoning is billed as output,
             // so no value is guessed here.
             reasoning_in_output: None,
-            // Not recorded in the snapshot: the selector degrades only the
-            // requests that need a minimum prefix (`cache_ineligible`) instead
-            // of inventing one.
-            min_cacheable_prefix_tokens: None,
-            // Cache read and write rates are recorded, so the eligibility rules
-            // are usable; the minimum-prefix requirement above stays a
-            // per-request unknown.
+            // Not recorded by the pricing snapshot, but documented by OpenAI for
+            // this model family; recorded here with its provenance rather than
+            // inferred. Without it the selector can never claim cache
+            // eligibility and a warm prefix is always mispriced as uncached.
+            min_cacheable_prefix_tokens: Some(LUNA_MIN_CACHEABLE_PREFIX_TOKENS),
+            // Cache read and write rates and the minimum prefix are all known,
+            // so the eligibility rules are usable for this slug.
             cache_eligibility_known: true,
             long_context: Some(working_set::LongContextRule {
                 threshold_tokens: 272_000,
