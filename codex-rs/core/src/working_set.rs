@@ -2641,6 +2641,37 @@ mod tests {
         );
     }
 
+    /// Regression for the observed live defect: without restored usage evidence
+    /// every selection recorded `pricing_unknown` with `expected_output_tokens`
+    /// as the sole unknown, so `applied` was always false and the wire never
+    /// shrank. Usage is the only unknown that decides confidence here, so the
+    /// same inputs must flip from fallback to applied purely on that input.
+    #[test]
+    fn missing_usage_forces_fallback_and_present_usage_applies() {
+        let catalog = synthetic_catalog();
+        let without = standard_fixture(Some(&catalog), None, None);
+        let frozen_without = without.freeze();
+        assert!(!frozen_without.applied());
+        assert_eq!(
+            frozen_without.manifest().cost.unknown_fields,
+            vec!["expected_output_tokens".to_string()]
+        );
+        assert_eq!(
+            frozen_without.manifest().fallback.reason,
+            Some("pricing_unknown")
+        );
+
+        let restored_usage = usage();
+        let with = standard_fixture(Some(&catalog), Some(&restored_usage), None);
+        let frozen_with = with.freeze();
+        assert!(
+            frozen_with.applied(),
+            "usage evidence must let the selector apply the projection"
+        );
+        assert_eq!(frozen_with.manifest().cost.confidence.as_str(), "high");
+        assert!(frozen_with.manifest().cost.unknown_fields.is_empty());
+    }
+
     #[test]
     fn default_horizon_is_conservative() {
         let horizon = Horizon::default();

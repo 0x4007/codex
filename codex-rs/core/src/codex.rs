@@ -705,6 +705,13 @@ impl Session {
         rollout_items: &[RolloutItem],
     ) -> Vec<ResponseItem> {
         let mut history = ConversationHistory::new();
+        // Compact-on-demand: the newest persisted token-usage record is restored
+        // into the session so the working-set selector has usage evidence after a
+        // process boundary. Without it `expected_output_tokens` is unknown, cost
+        // confidence stays `low`, and selection always falls back to canonical
+        // history. The record is already written by `should_persist_event_msg`
+        // and reloaded by the recorder; this only reads it back.
+        let mut restored_usage: Option<TokenUsageInfo> = None;
         for item in rollout_items {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
@@ -720,7 +727,20 @@ impl Session {
                     );
                     history.replace(rebuilt);
                 }
+                RolloutItem::EventMsg(EventMsg::TokenCount(event)) => {
+                    // Last record wins: usage is cumulative, so the newest entry
+                    // describes the session as it stands now.
+                    if let Some(info) = event.info.as_ref() {
+                        restored_usage = Some(info.clone());
+                    }
+                }
                 _ => {}
+            }
+        }
+        if let Some(info) = restored_usage {
+            let mut state = self.state.lock_unchecked();
+            if state.token_info.is_none() {
+                state.token_info = Some(info);
             }
         }
         history.contents()
