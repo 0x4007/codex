@@ -339,26 +339,39 @@ async fn read_head_and_flags(
     Ok((head, saw_session_meta, saw_user_event))
 }
 
+/// Number of fuzzy filename candidates inspected when locating a rollout.
+///
+/// A canonical rollout and any adjacent file that embeds the same conversation
+/// id (for example a `*.working-set.jsonl` sidecar) score identically in the
+/// fuzzy search, so a single match cannot be trusted to be the canonical
+/// rollout. The limit only bounds how many candidates are validated below.
+const CONVERSATION_LOOKUP_CANDIDATE_LIMIT: usize = 16;
+
 /// Locate a recorded conversation rollout file by its UUID string using the existing
 /// paginated listing implementation. Returns `Ok(Some(path))` if found, `Ok(None)` if not present
 /// or the id is invalid.
+///
+/// Only canonical rollout filenames (`rollout-<timestamp>-<uuid>.jsonl`) whose
+/// embedded UUID equals `id_str` are eligible. Adjacent noncanonical files that
+/// also match the fuzzy search (for example a `*.working-set.jsonl` sidecar) are
+/// skipped instead of being returned.
 pub async fn find_conversation_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
 ) -> io::Result<Option<PathBuf>> {
     // Validate UUID format early.
-    if Uuid::parse_str(id_str).is_err() {
+    let Ok(requested_id) = Uuid::parse_str(id_str) else {
         return Ok(None);
-    }
+    };
 
     let mut root = codex_home.to_path_buf();
     root.push(SESSIONS_SUBDIR);
     if !root.exists() {
         return Ok(None);
     }
-    // This is safe because we know the values are valid.
+    // This is safe because we know the value is valid.
     #[allow(clippy::unwrap_used)]
-    let limit = NonZero::new(1).unwrap();
+    let limit = NonZero::new(CONVERSATION_LOOKUP_CANDIDATE_LIMIT).unwrap();
     // This is safe because we know the values are valid.
     #[allow(clippy::unwrap_used)]
     let threads = NonZero::new(2).unwrap();
@@ -377,9 +390,14 @@ pub async fn find_conversation_path_by_id_str(
     )
     .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
 
-    Ok(results
-        .matches
-        .into_iter()
-        .next()
-        .map(|m| root.join(m.path)))
+    // A fuzzy filename match is not evidence that the file is the canonical
+    // rollout: the sidecar shares the conversation id in its name and can rank
+    // ahead of the rollout. Validate every candidate as a canonical rollout
+    // filename carrying exactly the requested id and return the first one.
+    Ok(results.matches.into_iter().find_map(|m| {
+        let path = root.join(m.path);
+        let name = path.file_name()?.to_str()?;
+        let (_, candidate_id) = parse_timestamp_uuid_from_filename(name)?;
+        (candidate_id == requested_id).then_some(path)
+    }))
 }

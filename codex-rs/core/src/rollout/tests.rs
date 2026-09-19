@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::rollout::list::ConversationItem;
 use crate::rollout::list::ConversationsPage;
 use crate::rollout::list::Cursor;
+use crate::rollout::list::find_conversation_path_by_id_str;
 use crate::rollout::list::get_conversation;
 use crate::rollout::list::get_conversations;
 
@@ -442,4 +443,58 @@ async fn test_stable_ordering_same_second_pagination() {
         reached_scan_cap: false,
     };
     assert_eq!(page2, expected_page2);
+}
+
+#[tokio::test]
+async fn find_conversation_path_prefers_canonical_rollout_over_sidecar() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+
+    let ts = "2025-02-03T04-05-06";
+    let id = Uuid::from_u128(0x5eed);
+    write_session_file(home, ts, id, 1).unwrap();
+    let canonical = home
+        .join("sessions")
+        .join("2025")
+        .join("02")
+        .join("03")
+        .join(format!("rollout-{ts}-{id}.jsonl"));
+
+    // The sidecar carries the same conversation id in its filename and is an
+    // equally good fuzzy filename match for it, but it is not canonical history.
+    let sidecar = canonical.with_extension("working-set.jsonl");
+    fs::write(&sidecar, "{\"record\":\"selection\"}\n").unwrap();
+
+    let canonical_before = fs::read(&canonical).unwrap();
+    let sidecar_before = fs::read(&sidecar).unwrap();
+
+    let found = find_conversation_path_by_id_str(home, &id.to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(found.as_deref(), Some(canonical.as_path()));
+    // The lookup is read-only: neither file may be rewritten or removed.
+    assert_eq!(fs::read(&canonical).unwrap(), canonical_before);
+    assert_eq!(fs::read(&sidecar).unwrap(), sidecar_before);
+}
+
+#[tokio::test]
+async fn find_conversation_path_rejects_sidecar_without_canonical_rollout() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+
+    let ts = "2025-02-03T04-05-06";
+    let id = Uuid::from_u128(0xfeed);
+    let dir = home.join("sessions").join("2025").join("02").join("03");
+    fs::create_dir_all(&dir).unwrap();
+    let sidecar = dir.join(format!("rollout-{ts}-{id}.working-set.jsonl"));
+    fs::write(&sidecar, "{\"record\":\"selection\"}\n").unwrap();
+
+    // A sidecar alone is not a resumable conversation: no arbitrary fuzzy first
+    // match may be returned in place of the missing canonical rollout.
+    let found = find_conversation_path_by_id_str(home, &id.to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(found, None);
 }

@@ -13,6 +13,8 @@ use crate::client_common::REVIEW_PROMPT;
 use crate::event_mapping::map_response_item_to_event_messages;
 use async_channel::Receiver;
 use async_channel::Sender;
+use chrono::DateTime;
+use chrono::Utc;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_apply_patch::maybe_parse_apply_patch_verified;
@@ -119,6 +121,7 @@ use crate::unified_exec::UnifiedExecSessionManager;
 use crate::user_instructions::UserInstructions;
 use crate::user_notification::UserNotification;
 use crate::util::backoff;
+use crate::working_set;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::custom_prompts::CustomPrompt;
@@ -271,6 +274,12 @@ struct State {
     pending_input: Vec<ResponseInputItem>,
     history: ConversationHistory,
     token_info: Option<TokenUsageInfo>,
+    /// Epoch identity of the working set selected for the most recent user
+    /// request, used for cache-aware cost comparison (never a token budget).
+    last_working_set_epoch: Option<String>,
+    /// 1-based ordinal of the most recent user request whose working set was
+    /// frozen. Recorded in the selection sidecar; never a model input.
+    working_set_request_index: u64,
     next_internal_sub_id: u64,
 }
 
@@ -293,6 +302,12 @@ pub(crate) struct Session {
     /// Optional rollout recorder for persisting the conversation transcript so
     /// sessions can be replayed or inspected later.
     rollout: Mutex<Option<RolloutRecorder>>,
+    /// Synthetic pricing catalog injected by the internal test constructor only.
+    /// Production rates are resolved per request through
+    /// [`resolved_pricing_catalog`]; this field does not exist in a production
+    /// build, so synthetic rates cannot enter one.
+    #[cfg(test)]
+    working_set_test_catalog: Option<working_set::PricingCatalog>,
     state: Mutex<State>,
     codex_linux_sandbox_exe: Option<PathBuf>,
     user_shell: shell::Shell,
@@ -496,6 +511,8 @@ impl Session {
             notify,
             state: Mutex::new(state),
             rollout: Mutex::new(Some(rollout_recorder)),
+            #[cfg(test)]
+            working_set_test_catalog: None,
             codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
             user_shell: default_shell,
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
@@ -974,6 +991,81 @@ impl Session {
     /// history with additional items for this turn.
     pub fn turn_input_with_history(&self, extra: Vec<ResponseItem>) -> Vec<ResponseItem> {
         [self.state.lock_unchecked().history.contents(), extra].concat()
+    }
+
+    /// Provider-reported usage of the most recent response, when any. Recorded
+    /// data only: used as cost accounting input, never as a selection predicate.
+    fn last_token_usage(&self) -> Option<TokenUsage> {
+        self.state
+            .lock_unchecked()
+            .token_info
+            .as_ref()
+            .map(|info| info.last_token_usage.clone())
+    }
+
+    /// Epoch identity of the working set sent for the most recent user request.
+    fn last_working_set_epoch(&self) -> Option<String> {
+        self.state.lock_unchecked().last_working_set_epoch.clone()
+    }
+
+    fn set_last_working_set_epoch(&self, epoch_id: String) {
+        self.state.lock_unchecked().last_working_set_epoch = Some(epoch_id);
+    }
+
+    /// Advances and returns the 1-based ordinal of a user request whose working
+    /// set is being frozen. Used only for sidecar records, never as model input.
+    fn next_working_set_request_index(&self) -> u64 {
+        let mut state = self.state.lock_unchecked();
+        state.working_set_request_index += 1;
+        state.working_set_request_index
+    }
+
+    /// Recorded pricing catalog for the exact wire model of a request, when one
+    /// exists.
+    ///
+    /// Production rate data is resolved per request through
+    /// [`resolved_pricing_catalog`], which also validates the recorded snapshot
+    /// against the fixed reference TTL; a synthetic catalog can only be injected
+    /// by the internal test constructor and does not exist in a production build.
+    fn working_set_pricing_catalog(&self, model: &str) -> Option<working_set::PricingCatalog> {
+        if let Some(catalog) = resolved_pricing_catalog(model, Utc::now()) {
+            return Some(catalog);
+        }
+        #[cfg(test)]
+        {
+            if let Some(catalog) = self
+                .working_set_test_catalog
+                .as_ref()
+                .filter(|catalog| catalog.model == model)
+            {
+                return Some(catalog.clone());
+            }
+        }
+        None
+    }
+
+    /// Appends one structural record to the append-only selection sidecar next to
+    /// the session rollout (see [`working_set::selection_sidecar_path`]).
+    ///
+    /// Persistence is observational: a failure is logged and never changes the
+    /// model input, the canonical history or the task outcome.
+    async fn record_working_set_sidecar(&self, record: &working_set::SidecarRecord) {
+        let sidecar_path = {
+            let guard = self.rollout.lock_unchecked();
+            guard
+                .as_ref()
+                .map(|recorder| working_set::selection_sidecar_path(&recorder.get_rollout_path()))
+        };
+        let Some(path) = sidecar_path else {
+            debug!("working-set sidecar skipped: rollout recorder is disabled");
+            return;
+        };
+        if let Err(err) = append_sidecar_record(&path, record).await {
+            warn!(
+                path = %path.display(),
+                "failed to append working-set selection record: {err:#}"
+            );
+        }
     }
 
     /// Returns the input if there was no task running to inject into
@@ -1602,6 +1694,155 @@ async fn spawn_review_thread(
     .await;
 }
 
+/// Recorded provenance of the one reference-list price record, kept as a single
+/// string so every amount can name the snapshot it came from: the explicit price
+/// basis, the source URL, the recorded revision/date, the response-body digest
+/// and the docs-schema route/digest. It carries no rate, no invoice and no
+/// savings claim.
+const LUNA_REFERENCE_PRICE_SOURCE: &str = concat!(
+    "basis=openrouter_reference_list not_uos_invoice ",
+    "url=https://openrouter.ai/api/v1/models ",
+    "revision=openrouter-2026-09-19-5ecb4fe3 ",
+    "date=2026-09-19T00:12:35.624Z ",
+    "body_sha256=5ecb4fe389783c8f2bf49772ae6d405e230172f26401bc9ff06f45ad4c70ab74 ",
+    "docs_schema=https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties.md ",
+    "docs_schema_sha256=e973433327496ad6b12720c85c9c78cc28ee94b8af01c0ac33ad5ca120792a7c",
+);
+
+/// Production integration point for authoritative recorded rate data (M0 §4.1).
+///
+/// Returns the recorded, versioned pricing catalog for the exact wire model
+/// slug, or `None` when no record exists (every other model, including
+/// `gpt-6-astra`). The one record is the immutable OpenRouter public-catalog
+/// snapshot captured 2026-09-19 (`openrouter-2026-09-19-5ecb4fe3`): OpenRouter
+/// reference list prices in USD, recorded in the catalog's `per_1m_tokens`
+/// unit. It is not a UOS invoice price and nothing here measures or claims
+/// savings.
+///
+/// The snapshot's `web_search` price is charged per call, not per token, so it
+/// is deliberately absent from this token-rate record. Its long-context tier
+/// (strict `prompt_tokens_total > 272000`) prices the terms separately and is
+/// recorded as per-term rates ([`working_set::LongContextTermRates`]): above the
+/// threshold each recorded rate overrides that term's base rate and a term the
+/// tier does not record inherits its base rate.
+///
+/// The record itself claims no freshness: [`resolved_pricing_catalog`] validates
+/// the snapshot age against the fixed reference TTL when it is resolved.
+fn recorded_pricing_catalog(model: &str) -> Option<working_set::PricingCatalog> {
+    match model {
+        // Exact string equality on the wire slug only: no namespace, alias,
+        // `:batch`/`:free` suffix, `-pro` variant or fuzzy match resolves here.
+        "gpt-5.6-luna" => Some(working_set::PricingCatalog {
+            catalog_version: "openrouter-2026-09-19-5ecb4fe3".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+            provider: "openrouter".to_string(),
+            currency: "USD".to_string(),
+            unit: "per_1m_tokens".to_string(),
+            price_source: Some(LUNA_REFERENCE_PRICE_SOURCE.to_string()),
+            fetched_at: Some("2026-09-19T00:12:35.624Z".to_string()),
+            // Freshness is established when the record is resolved against the
+            // fixed reference TTL; the immutable record never claims it.
+            freshness: working_set::Freshness::Unknown,
+            // Snapshot USD-per-token rates x 1e6, in the catalog's per-1M unit.
+            uncached_input_rate: Some(0.2),
+            cached_input_rate: Some(0.02),
+            cache_write_rate: Some(0.25),
+            output_rate: Some(1.2),
+            // The snapshot's `completion` price covers generated output, but the
+            // row does not record whether internal reasoning is billed as output,
+            // so no value is guessed here.
+            reasoning_in_output: None,
+            // Not recorded in the snapshot: the selector degrades only the
+            // requests that need a minimum prefix (`cache_ineligible`) instead
+            // of inventing one.
+            min_cacheable_prefix_tokens: None,
+            // Cache read and write rates are recorded, so the eligibility rules
+            // are usable; the minimum-prefix requirement above stays a
+            // per-request unknown.
+            cache_eligibility_known: true,
+            long_context: Some(working_set::LongContextRule {
+                threshold_tokens: 272_000,
+                // Unused while `term_rates` is recorded: the tier prices each
+                // term with its own rate, so no uniform multiplier applies.
+                multiplier: 1.0,
+                term_rates: Some(working_set::LongContextTermRates {
+                    // Snapshot USD-per-token tier rates x 1e6.
+                    uncached_input_rate: Some(0.4),
+                    cached_input_rate: Some(0.04),
+                    cache_write_rate: Some(0.5),
+                    output_rate: Some(1.8),
+                }),
+            }),
+            // Every rate the selector consumes is populated; the min-prefix
+            // absence is a per-request `cache_ineligible` fallback, not a
+            // catalog-level unknown that would degrade every request.
+            unknown_fields: Vec::new(),
+        }),
+        _ => None,
+    }
+}
+
+/// Fixed conservative TTL of a recorded reference-list snapshot. It is not a
+/// product knob: an older snapshot must never drive cost, so it resolves stale.
+const REFERENCE_PRICE_TTL_DAYS: i64 = 7;
+
+/// Freshness of a recorded snapshot at `now`, against the fixed reference TTL.
+///
+/// Stale, future-dated and unparseable/missing fetch dates are all `Stale`: the
+/// record cannot be verified as current, so the selector falls back with an
+/// explicit `pricing_stale` reason instead of costing from it.
+fn reference_price_freshness(
+    fetched_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> working_set::Freshness {
+    let Some(fetched_at) = fetched_at else {
+        return working_set::Freshness::Stale;
+    };
+    let Ok(fetched_at) = DateTime::parse_from_rfc3339(fetched_at) else {
+        return working_set::Freshness::Stale;
+    };
+    let fetched_at = fetched_at.with_timezone(&Utc);
+    if fetched_at > now || fetched_at < now - chrono::Duration::days(REFERENCE_PRICE_TTL_DAYS) {
+        return working_set::Freshness::Stale;
+    }
+    working_set::Freshness::Fresh
+}
+
+/// Resolves the recorded catalog for an exact wire model slug at `now`, checking
+/// the snapshot age against the fixed reference TTL. Pure given `(model, now)`
+/// so the frozen selection stays deterministic: `freeze` reads the recorded
+/// freshness and never a clock.
+fn resolved_pricing_catalog(
+    model: &str,
+    now: DateTime<Utc>,
+) -> Option<working_set::PricingCatalog> {
+    let mut catalog = recorded_pricing_catalog(model)?;
+    catalog.freshness = reference_price_freshness(catalog.fetched_at.as_deref(), now);
+    Some(catalog)
+}
+
+/// Appends one JSON line to the append-only selection sidecar (create + append,
+/// flushed before returning). Callers log failures and continue: persistence
+/// never affects the model input or the canonical history.
+async fn append_sidecar_record(
+    path: &std::path::Path,
+    record: &working_set::SidecarRecord,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let line = serde_json::to_string(record)
+        .map_err(|err| std::io::Error::other(format!("serialize sidecar record: {err}")))?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+    Ok(())
+}
+
 /// Takes a user message as input and runs a loop where, at each turn, the model
 /// replies with either:
 ///
@@ -1642,11 +1883,96 @@ async fn run_task(
     // For normal turns, continue recording to the session history as before.
     let is_review_mode = turn_context.is_review_mode;
     let mut review_thread_history: Vec<ResponseItem> = Vec::new();
+    // Compact-on-demand: freeze the working set once per user request, before the
+    // first model turn. Internal tool follow-up turns below reuse the frozen
+    // projection and append the freshly recorded items (active tool chain)
+    // verbatim. Review threads keep their isolated in-memory history and are
+    // excluded from selection in this slice.
+    let mut request_working_set: Option<working_set::FrozenSelection> = None;
+    let mut working_set_request_index: u64 = 0;
+    let mut turn_index: u64 = 0;
     if is_review_mode {
         review_thread_history.push(initial_input_for_turn.into());
     } else {
+        working_set_request_index = sess.next_working_set_request_index();
+        // Snapshot the canonical history before the request input is appended so
+        // the request itself is pinned as `current_request` rather than history.
+        let mut freeze_input = sess.turn_input_with_history(Vec::new());
+        let current_request_start = freeze_input.len();
         sess.record_input_and_rollout_usermsg(&initial_input_for_turn)
             .await;
+        freeze_input.push(initial_input_for_turn.into());
+        let previous_epoch = sess.last_working_set_epoch();
+        let usage = sess
+            .last_token_usage()
+            .as_ref()
+            .map(working_set::UsageEvidence::from_token_usage);
+        // The effective instructions and tool set are part of the epoch identity.
+        // Their digests are recorded; the text and definitions never are.
+        let tools = get_openai_tools(
+            &turn_context.tools_config,
+            Some(sess.mcp_connection_manager.list_all_tools()),
+        );
+        let instructions = Prompt {
+            input: Vec::new(),
+            tools: tools.clone(),
+            base_instructions_override: turn_context.base_instructions.clone(),
+        }
+        .get_full_instructions(&turn_context.client.get_model_family())
+        .into_owned();
+        let model = turn_context.client.get_model();
+        let catalog = sess.working_set_pricing_catalog(&model);
+        let frozen = working_set::freeze(&working_set::FreezeInputs {
+            model,
+            reasoning_effort: turn_context
+                .client
+                .get_reasoning_effort()
+                .map(|effort| effort.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            instructions_digest: working_set::digest_text(&instructions),
+            tools_digest: working_set::digest_serialized(&tools),
+            canonical: &freeze_input,
+            current_request_start,
+            explicit_pins: &[],
+            // Authoritative recorded rates are resolved per request by
+            // `recorded_pricing_catalog` (the production integration point). The
+            // one recorded OpenRouter reference-list record covers the exact
+            // `gpt-5.6-luna` wire slug; every other model resolves to `None` and
+            // the selector records `pricing_unknown` and sends the canonical
+            // input unchanged (I6/I10/I12).
+            catalog: catalog.as_ref(),
+            usage: usage.as_ref(),
+            previous_epoch_id: previous_epoch.as_deref(),
+            horizon: working_set::Horizon::default(),
+        });
+        let manifest = frozen.manifest();
+        debug!(
+            model = %manifest.model,
+            canonical_len = manifest.canonical.log_len,
+            projection_len = manifest.projection.len,
+            projection_digest = %manifest.projection.digest,
+            manifest_digest = %frozen.manifest_digest(),
+            confidence = manifest.cost.confidence.as_str(),
+            applied = manifest.decision.applied,
+            fallback = manifest.fallback.reason.unwrap_or("none"),
+            "compact-on-demand working set frozen for user request"
+        );
+        sess.set_last_working_set_epoch(frozen.epoch_id().to_string());
+        request_working_set = Some(frozen);
+        // Persist the structural selection manifest once per user request. The
+        // canonical digest before the request was appended and the canonical input
+        // the selection was derived from are both recorded; selection never
+        // mutates the canonical history, so the latter equals the manifest digest.
+        let canonical_digest_before_request =
+            working_set::digest_items(&freeze_input[..current_request_start]);
+        if let Some(frozen) = request_working_set.as_ref() {
+            let record = working_set::SidecarRecord::selection(
+                working_set_request_index,
+                frozen,
+                canonical_digest_before_request,
+            );
+            sess.record_working_set_sidecar(&record).await;
+        }
     }
 
     let mut last_agent_message: Option<String> = None;
@@ -1698,12 +2024,62 @@ async fn run_task(
                 })
             })
             .collect();
+        // The working-set projection replaces only `Prompt.input`. The freshly
+        // recorded items after the frozen prefix are appended verbatim, and any
+        // mismatch falls back to the canonical input for this turn. Every model
+        // turn is recorded in the sidecar with the canonical and wire digests it
+        // actually used.
+        turn_index += 1;
+        let canonical_digest = working_set::digest_items(&turn_input);
+        let derived_input = request_working_set
+            .as_ref()
+            .map(|frozen| frozen.derived_input(&turn_input));
+        if let (Some(frozen), Some(derived)) =
+            (request_working_set.as_ref(), derived_input.as_ref())
+        {
+            let (decision, reason, wire_len, wire_digest) = match derived {
+                working_set::DerivedInput::Projected(items) => (
+                    working_set::SIDECAR_DECISION_PROJECTED,
+                    working_set::SIDECAR_DECISION_PROJECTED,
+                    items.len(),
+                    working_set::digest_items(items),
+                ),
+                working_set::DerivedInput::Canonical(reason) => {
+                    debug!(
+                        reason = reason.as_str(),
+                        "compact-on-demand working set canonical fallback"
+                    );
+                    (
+                        working_set::SIDECAR_DECISION_CANONICAL,
+                        reason.as_str(),
+                        turn_input.len(),
+                        canonical_digest.clone(),
+                    )
+                }
+            };
+            let record = working_set::SidecarRecord::Turn {
+                request_index: working_set_request_index,
+                turn_index,
+                decision,
+                reason,
+                epoch_id: frozen.epoch_id().to_string(),
+                canonical_len: turn_input.len(),
+                canonical_digest,
+                wire_len,
+                wire_digest,
+            };
+            sess.record_working_set_sidecar(&record).await;
+        }
+        let model_input = match derived_input {
+            Some(working_set::DerivedInput::Projected(items)) => items,
+            _ => turn_input,
+        };
         match run_turn(
             &sess,
             turn_context.as_ref(),
             &mut turn_diff_tracker,
             sub_id.clone(),
-            turn_input,
+            model_input,
         )
         .await
         {
@@ -3548,6 +3924,7 @@ mod tests {
             unified_exec_manager: UnifiedExecSessionManager::default(),
             notify: None,
             rollout: Mutex::new(None),
+            working_set_test_catalog: None,
             state: Mutex::new(State {
                 history: ConversationHistory::new(),
                 ..Default::default()
@@ -3659,5 +4036,627 @@ mod tests {
         rollout_items.push(RolloutItem::ResponseItem(assistant3.clone()));
 
         (rollout_items, live_history.contents())
+    }
+
+    /// Synthetic catalog: structural test data only, not any provider's price.
+    fn synthetic_pricing_catalog(model: &str) -> working_set::PricingCatalog {
+        working_set::PricingCatalog {
+            catalog_version: "synthetic-test-0".to_string(),
+            model: model.to_string(),
+            provider: "synthetic".to_string(),
+            currency: "USD".to_string(),
+            unit: "per_1m_tokens".to_string(),
+            price_source: Some("synthetic://test-only".to_string()),
+            fetched_at: Some("2026-09-18T00:00:00Z".to_string()),
+            freshness: working_set::Freshness::Fresh,
+            uncached_input_rate: Some(1.0),
+            cached_input_rate: Some(0.05),
+            cache_write_rate: Some(2.0),
+            output_rate: Some(1.0),
+            reasoning_in_output: Some(true),
+            min_cacheable_prefix_tokens: Some(1),
+            cache_eligibility_known: true,
+            long_context: None,
+            unknown_fields: Vec::new(),
+        }
+    }
+
+    /// The production hook resolves one exact recorded reference-list record and
+    /// nothing else. Rate values are asserted only where they are recorded (the
+    /// catalog itself); this test pins identity, provenance and basis.
+    #[test]
+    fn recorded_pricing_catalog_is_exact_luna_reference_list_only() {
+        let catalog = recorded_pricing_catalog("gpt-5.6-luna").expect("luna record");
+        assert_eq!(catalog.catalog_version, "openrouter-2026-09-19-5ecb4fe3");
+        assert_eq!(catalog.model, "gpt-5.6-luna");
+        assert_eq!(catalog.provider, "openrouter");
+        assert_eq!(catalog.currency, "USD");
+        assert_eq!(catalog.unit, "per_1m_tokens");
+        // The immutable record claims no freshness of its own; the resolver
+        // validates it against the fixed TTL (see the freshness test below).
+        assert_eq!(catalog.freshness, working_set::Freshness::Unknown);
+        // The snapshot does not record whether reasoning is billed as output, so
+        // no derivation is guessed.
+        assert_eq!(catalog.reasoning_in_output, None);
+        assert_eq!(
+            catalog.fetched_at.as_deref(),
+            Some("2026-09-19T00:12:35.624Z")
+        );
+        let source = catalog
+            .price_source
+            .as_deref()
+            .expect("recorded price source");
+        for expected in [
+            "basis=openrouter_reference_list",
+            "https://openrouter.ai/api/v1/models",
+            "revision=openrouter-2026-09-19-5ecb4fe3",
+            "date=2026-09-19T00:12:35.624Z",
+            "body_sha256=5ecb4fe389783c8f2bf49772ae6d405e230172f26401bc9ff06f45ad4c70ab74",
+            "docs_schema_sha256=e973433327496ad6b12720c85c9c78cc28ee94b8af01c0ac33ad5ca120792a7c",
+        ] {
+            assert!(source.contains(expected), "price source lacks {expected}");
+        }
+        assert!(catalog.unknown_fields.is_empty());
+        // Every rate the selector consumes is populated, so the empty
+        // `unknown_fields` does not hide a missing rate.
+        assert!(catalog.uncached_input_rate.is_some());
+        assert!(catalog.cached_input_rate.is_some());
+        assert!(catalog.cache_write_rate.is_some());
+        assert!(catalog.output_rate.is_some());
+        assert!(catalog.cache_eligibility_known);
+        assert_eq!(
+            catalog.long_context.map(|rule| rule.threshold_tokens),
+            Some(272_000)
+        );
+        assert!(
+            catalog
+                .long_context
+                .is_some_and(|rule| rule.term_rates.is_some()),
+            "the recorded tier prices terms separately"
+        );
+        // Exact string equality only: aliases, neighboring variants and other
+        // slugs (including gpt-6-astra) must not resolve a record.
+        for model in [
+            "gpt-6-astra",
+            "openai/gpt-5.6-luna",
+            "gpt-5.6-luna-pro",
+            "gpt-5.6-luna:batch",
+            "gpt-5.6-luna-20260709",
+            "gpt-5.6",
+            "",
+        ] {
+            assert!(
+                recorded_pricing_catalog(model).is_none(),
+                "{model} must not resolve a recorded catalog"
+            );
+        }
+    }
+
+    /// The recorded snapshot is fresh at its own recorded date and stale once it
+    /// is older than the fixed 7-day reference TTL, future-dated, unreadable or
+    /// missing.
+    #[test]
+    fn reference_price_freshness_uses_the_fixed_seven_day_ttl() {
+        let now = DateTime::parse_from_rfc3339("2026-09-19T00:12:35.624Z")
+            .expect("rfc3339 timestamp")
+            .with_timezone(&Utc);
+        assert_eq!(
+            reference_price_freshness(Some("2026-09-19T00:12:35.624Z"), now),
+            working_set::Freshness::Fresh
+        );
+        // Exactly seven days old is still inside the TTL; one second older is not.
+        assert_eq!(
+            reference_price_freshness(Some("2026-09-12T00:12:35.624Z"), now),
+            working_set::Freshness::Fresh
+        );
+        assert_eq!(
+            reference_price_freshness(Some("2026-09-12T00:12:34.624Z"), now),
+            working_set::Freshness::Stale
+        );
+        // Future-dated, unreadable and missing fetch dates cannot be verified.
+        assert_eq!(
+            reference_price_freshness(Some("2026-09-19T00:12:35.625Z"), now),
+            working_set::Freshness::Stale
+        );
+        assert_eq!(
+            reference_price_freshness(Some("not-a-date"), now),
+            working_set::Freshness::Stale
+        );
+        assert_eq!(
+            reference_price_freshness(None, now),
+            working_set::Freshness::Stale
+        );
+    }
+
+    /// Regression on the production resolution path: the real recorded Luna
+    /// reference record (no synthetic injection) must resolve fresh and cost a
+    /// real selection, proving the production lookup does not always fall back.
+    ///
+    /// "Now" is derived from the recorded snapshot date, so the regression is
+    /// deterministic and never depends on wall-clock time. The unrecorded
+    /// `min_cacheable_prefix_tokens` is never needed here: the changed-epoch path
+    /// bills the recorded cache-write rate instead of cached tokens.
+    #[test]
+    fn resolved_luna_record_applies_a_real_projection_without_a_synthetic_catalog() {
+        let fetched_at = recorded_pricing_catalog("gpt-5.6-luna")
+            .expect("recorded luna record")
+            .fetched_at
+            .expect("recorded fetch date");
+        let now = DateTime::parse_from_rfc3339(&fetched_at)
+            .expect("recorded fetch date is rfc3339")
+            .with_timezone(&Utc)
+            + chrono::Duration::hours(1);
+        let catalog = resolved_pricing_catalog("gpt-5.6-luna", now).expect("resolved catalog");
+        assert_eq!(catalog.freshness, working_set::Freshness::Fresh);
+
+        let user = |text: &str| ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+        };
+        let canonical = vec![
+            user("earlier note about src/legacy.rs"),
+            user("unrelated chatter about lunch"),
+            user("now fix src/legacy.rs"),
+        ];
+        let usage = working_set::UsageEvidence {
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 50,
+        };
+        let frozen = working_set::freeze(&working_set::FreezeInputs {
+            model: "gpt-5.6-luna".to_string(),
+            reasoning_effort: "none".to_string(),
+            instructions_digest: working_set::digest_text("INSTRUCTIONS_TEXT"),
+            tools_digest: working_set::digest_serialized(&json!([])),
+            canonical: &canonical,
+            current_request_start: 2,
+            explicit_pins: &[],
+            catalog: Some(&catalog),
+            usage: Some(&usage),
+            previous_epoch_id: None,
+            horizon: working_set::Horizon::default(),
+        });
+        let manifest = frozen.manifest();
+        assert_eq!(manifest.cost.confidence, working_set::Confidence::High);
+        assert!(manifest.cost.unknown_fields.is_empty());
+        assert!(manifest.decision.applied);
+        assert_eq!(manifest.decision.reason, "lower_expected_cost");
+        assert!(!manifest.fallback.used);
+        // The projection really shrinks the wire input.
+        assert!(manifest.projection.len < manifest.canonical.log_len);
+        match frozen.derived_input(&canonical) {
+            working_set::DerivedInput::Projected(items) => {
+                assert!(items.len() < canonical.len());
+            }
+            other => panic!("expected a projected input, got {other:?}"),
+        }
+        // The amount is computed from the recorded rates, not a fallback: the
+        // changed epoch bills the recorded cache-write rate and the output term
+        // uses the recorded output rate.
+        let baseline = manifest
+            .cost
+            .baseline
+            .breakdown
+            .expect("recorded catalog is costed");
+        assert_eq!(baseline.long_context_multiplier, 1.0);
+        assert_eq!(
+            baseline.cache_write,
+            manifest.cost.baseline.tokens.cache_write as f64 / 1_000_000.0 * 0.25
+        );
+        assert_eq!(baseline.output, 50.0 / 1_000_000.0 * 1.2);
+        assert_eq!(baseline.total, baseline.cache_write + baseline.output);
+    }
+
+    /// Real core-loop integration test at the existing mock-server seam.
+    ///
+    /// A synthetic high-confidence catalog is injected through the internal
+    /// session constructor only, then the actual `run_task` path must:
+    /// (1) reduce the wire input for the second user request, (2) leave the
+    /// canonical history identical (omitted items are still recorded), (3) carry
+    /// the fresh tool continuation verbatim on the follow-up turn, (4) never
+    /// re-dispatch a historical tool call, and (5) persist one structural
+    /// selection record per user request plus one record per model turn in the
+    /// append-only sidecar.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn working_set_projection_reduces_wire_and_keeps_canonical_history() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use crate::auth::AuthManager;
+        use crate::auth::CodexAuth;
+        use codex_protocol::models::FunctionCallOutputPayload;
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::Respond;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::method;
+        use wiremock::matchers::path;
+
+        fn sse(events: Vec<serde_json::Value>) -> String {
+            let mut body = String::new();
+            for event in events {
+                let kind = event["type"].as_str().expect("sse event type");
+                body.push_str(&format!("event: {kind}\n"));
+                body.push_str(&format!("data: {event}\n\n"));
+            }
+            body
+        }
+
+        fn completed(id: &str, input_tokens: u64) -> serde_json::Value {
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": id,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "input_tokens_details": null,
+                        "output_tokens": 10,
+                        "output_tokens_details": null,
+                        "total_tokens": input_tokens + 10
+                    }
+                }
+            })
+        }
+
+        fn assistant_message(id: &str, text: &str) -> serde_json::Value {
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": id,
+                    "content": [{"type": "output_text", "text": text}]
+                }
+            })
+        }
+
+        fn function_call(call_id: &str, name: &str, arguments: &str) -> serde_json::Value {
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments
+                }
+            })
+        }
+
+        #[derive(Clone)]
+        struct SequencedSseResponder {
+            bodies: Arc<Vec<String>>,
+            requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for SequencedSseResponder {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let index = self.calls.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body is JSON");
+                self.requests.lock().expect("requests lock").push(body);
+                let response = self
+                    .bodies
+                    .get(index)
+                    .unwrap_or_else(|| panic!("unexpected model request {index}"))
+                    .clone();
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(response, "text/event-stream")
+            }
+        }
+
+        // Request 1 finishes with a message (and records token usage); request 2
+        // asks for the plan tool; request 3 is the follow-up turn.
+        let responder = SequencedSseResponder {
+            bodies: Arc::new(vec![
+                sse(vec![
+                    assistant_message("m1", "FIRST_REPLY"),
+                    completed("r1", 1_000),
+                ]),
+                sse(vec![
+                    function_call(
+                        "call_fresh",
+                        "update_plan",
+                        r#"{"plan":[{"step":"wire step","status":"in_progress"}]}"#,
+                    ),
+                    completed("r2", 1_100),
+                ]),
+                sse(vec![
+                    assistant_message("m3", "SECOND_REPLY"),
+                    completed("r3", 1_200),
+                ]),
+            ]),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+
+        let codex_home = tempfile::tempdir().expect("codex home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect("load default test config");
+        config.cwd = cwd.path().to_path_buf();
+        config.model_provider = ModelProviderInfo {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..crate::built_in_model_providers()["openai"].clone()
+        };
+        config.include_plan_tool = true;
+        config.user_instructions = None;
+        let config = Arc::new(config);
+        let catalog = synthetic_pricing_catalog(&config.model);
+
+        let conversation_id = ConversationId::default();
+        let rollout_recorder =
+            RolloutRecorder::new(&config, RolloutRecorderParams::new(conversation_id, None))
+                .await
+                .expect("create rollout recorder");
+        let rollout_path = rollout_recorder.get_rollout_path();
+
+        let client = ModelClient::new(
+            config.clone(),
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "Test API Key",
+            ))),
+            config.model_provider.clone(),
+            config.model_reasoning_effort,
+            config.model_reasoning_summary,
+            conversation_id,
+        );
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &config.model_family,
+            approval_policy: config.approval_policy,
+            sandbox_policy: config.sandbox_policy.clone(),
+            include_plan_tool: config.include_plan_tool,
+            include_apply_patch_tool: config.include_apply_patch_tool,
+            include_web_search_request: config.tools_web_search_request,
+            use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+            include_view_image_tool: config.include_view_image_tool,
+            experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+        });
+        let turn_context = Arc::new(TurnContext {
+            client,
+            cwd: config.cwd.clone(),
+            base_instructions: config.base_instructions.clone(),
+            user_instructions: config.user_instructions.clone(),
+            approval_policy: config.approval_policy,
+            sandbox_policy: config.sandbox_policy.clone(),
+            shell_environment_policy: config.shell_environment_policy.clone(),
+            tools_config,
+            is_review_mode: false,
+        });
+        let (tx_event, rx_event) = async_channel::unbounded();
+        let session = Arc::new(Session {
+            conversation_id,
+            tx_event,
+            mcp_connection_manager: McpConnectionManager::default(),
+            session_manager: ExecSessionManager::default(),
+            unified_exec_manager: UnifiedExecSessionManager::default(),
+            notify: None,
+            rollout: Mutex::new(Some(rollout_recorder)),
+            working_set_test_catalog: Some(catalog),
+            state: Mutex::new(State {
+                history: ConversationHistory::new(),
+                ..Default::default()
+            }),
+            codex_linux_sandbox_exe: None,
+            user_shell: shell::Shell::Unknown,
+            show_raw_agent_reasoning: false,
+        });
+        session
+            .record_initial_history(&turn_context, InitialHistory::New)
+            .await;
+        // Canonical history: one anchored message, one unanchored exchange and one
+        // historical (already completed) tool pair that must never run again.
+        let seeded_history = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "the earlier note mentions src/legacy.rs".to_string(),
+                }],
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "noted".to_string(),
+                }],
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "update_plan".to_string(),
+                arguments: r#"{"plan":[{"step":"historical step","status":"completed"}]}"#
+                    .to_string(),
+                call_id: "call_hist".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call_hist".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "Plan updated".to_string(),
+                    success: Some(true),
+                },
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "unrelated chatter about lunch".to_string(),
+                }],
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "ok".to_string(),
+                }],
+            },
+        ];
+        session.record_conversation_items(&seeded_history).await;
+
+        // Request 1 anchors `src/legacy.rs` and establishes provider usage
+        // evidence; its own selection still falls back because no usage is
+        // recorded yet.
+        run_task(
+            session.clone(),
+            turn_context.clone(),
+            "sub-1".to_string(),
+            vec![InputItem::Text {
+                text: "first request about src/legacy.rs".to_string(),
+            }],
+        )
+        .await;
+        // Request 2 anchors `src/legacy.rs` and runs one tool turn.
+        run_task(
+            session.clone(),
+            turn_context.clone(),
+            "sub-2".to_string(),
+            vec![InputItem::Text {
+                text: "now fix src/legacy.rs".to_string(),
+            }],
+        )
+        .await;
+
+        let requests = responder.requests.lock().expect("requests lock").clone();
+        assert_eq!(
+            requests.len(),
+            3,
+            "historical tool calls must not be re-dispatched"
+        );
+        let request_1_input = requests[0]["input"].as_array().expect("request 1 input");
+        let request_2_input = requests[1]["input"].as_array().expect("request 2 input");
+        let follow_up_input = requests[2]["input"].as_array().expect("request 3 input");
+        assert!(
+            request_2_input.len() < request_1_input.len(),
+            "wire input must be reduced relative to canonical history"
+        );
+        assert!(
+            request_2_input
+                .iter()
+                .any(|item| item.to_string().contains("src/legacy.rs")),
+            "anchored history must be retained"
+        );
+        assert!(
+            !request_2_input
+                .iter()
+                .any(|item| item.to_string().contains("unrelated chatter about lunch")),
+            "unanchored history must be omitted from the wire"
+        );
+        assert!(
+            !request_2_input
+                .iter()
+                .any(|item| item.to_string().contains("call_hist")),
+            "historical calls must not be re-sent as pending work"
+        );
+        assert!(
+            follow_up_input.len() > request_2_input.len(),
+            "the fresh tool continuation is appended to the projection"
+        );
+        let fresh_call = &follow_up_input[follow_up_input.len() - 2];
+        let fresh_output = &follow_up_input[follow_up_input.len() - 1];
+        assert_eq!(fresh_call["type"], json!("function_call"));
+        assert_eq!(fresh_call["call_id"], json!("call_fresh"));
+        assert!(
+            fresh_call["arguments"]
+                .as_str()
+                .expect("arguments")
+                .contains("wire step")
+        );
+        assert_eq!(fresh_output["type"], json!("function_call_output"));
+        assert_eq!(fresh_output["call_id"], json!("call_fresh"));
+        assert!(
+            !follow_up_input
+                .iter()
+                .any(|item| item.to_string().contains("call_hist")),
+            "historical calls must not reappear after the overlay"
+        );
+
+        // Canonical history is untouched: every omitted item is still recorded.
+        let canonical_history = session.turn_input_with_history(Vec::new());
+        assert_eq!(canonical_history.len(), 13);
+        assert!(canonical_history.iter().any(|item| {
+            serde_json::to_string(item)
+                .expect("item json")
+                .contains("unrelated chatter about lunch")
+        }));
+        assert!(canonical_history.iter().any(|item| {
+            serde_json::to_string(item)
+                .expect("item json")
+                .contains("call_hist")
+        }));
+        let mut plan_updates = 0;
+        while let Ok(event) = rx_event.try_recv() {
+            if matches!(event.msg, EventMsg::PlanUpdate(_)) {
+                plan_updates += 1;
+            }
+        }
+        assert_eq!(plan_updates, 1, "only the fresh tool call may execute");
+
+        // Sidecar contract: one selection record per user request, one turn record
+        // per model turn, structural digests only.
+        let sidecar_path = working_set::selection_sidecar_path(&rollout_path);
+        let sidecar = std::fs::read_to_string(&sidecar_path).expect("selection sidecar exists");
+        let records: Vec<serde_json::Value> = sidecar
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("sidecar line is JSON"))
+            .collect();
+        let selections: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["record"] == json!("selection"))
+            .collect();
+        let turns: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["record"] == json!("turn"))
+            .collect();
+        assert_eq!(selections.len(), 2, "one selection record per user request");
+        assert_eq!(turns.len(), 3, "one turn record per model turn");
+        assert_eq!(selections[0]["request_index"], json!(1));
+        assert_eq!(selections[0]["applied"], json!(false));
+        assert_eq!(selections[0]["fallback_reason"], json!("pricing_unknown"));
+        assert_eq!(selections[1]["request_index"], json!(2));
+        assert_eq!(selections[1]["applied"], json!(true));
+        assert_eq!(
+            selections[1]["canonical_digest_after_selection"],
+            selections[1]["manifest"]["canonical"]["digest"]
+        );
+        assert_ne!(
+            selections[1]["canonical_digest_before_request"],
+            selections[1]["canonical_digest_after_selection"]
+        );
+        assert_eq!(turns[0]["request_index"], json!(1));
+        assert_eq!(turns[0]["decision"], json!("canonical"));
+        assert_eq!(turns[0]["reason"], json!("pricing_unknown"));
+        assert_eq!(turns[1]["request_index"], json!(2));
+        assert_eq!(turns[1]["decision"], json!("projected"));
+        assert!(
+            turns[1]["wire_len"].as_u64().expect("wire_len")
+                < turns[1]["canonical_len"].as_u64().expect("canonical_len")
+        );
+        assert_eq!(turns[2]["turn_index"], json!(2));
+        assert_eq!(turns[2]["decision"], json!("projected"));
+        for private in [
+            "src/legacy.rs",
+            "unrelated chatter about lunch",
+            "historical step",
+            "wire step",
+        ] {
+            assert!(
+                !sidecar.contains(private),
+                "selection sidecar leaked private value {private}"
+            );
+        }
     }
 }
