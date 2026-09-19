@@ -589,6 +589,9 @@ impl Session {
                 if !reconstructed_history.is_empty() {
                     self.record_into_history(&reconstructed_history);
                 }
+                // Cache-aware accounting needs the epoch the previous request
+                // actually sent; it lives in the sidecar, not the rollout.
+                self.restore_working_set_epoch().await;
 
                 // If persisting, persist all rollout items as-is (recorder filters)
                 if persist && !rollout_items.is_empty() {
@@ -1085,6 +1088,58 @@ impl Session {
                 path = %path.display(),
                 "failed to append working-set selection record: {err:#}"
             );
+        }
+    }
+
+    /// Restores the previous working-set epoch identity from the append-only
+    /// selection sidecar so a resumed process keeps cache-aware cost accounting.
+    ///
+    /// Without it `previous_epoch_id` is `None` after a process boundary, the
+    /// already-warm baseline prefix is mispriced as a fresh cache write, and the
+    /// selector can wrongly prefer a projection over a cheaper cached baseline.
+    /// The newest `turn.epoch_id` (falling back to the newest `selection`
+    /// `manifest.epoch.epoch_id`) is the epoch the previous request actually
+    /// sent, so it is the correct comparison point.
+    ///
+    /// Best effort: a missing, unreadable or malformed sidecar leaves the
+    /// conservative default in place and never changes the task outcome.
+    async fn restore_working_set_epoch(&self) {
+        let sidecar_path = {
+            let guard = self.rollout.lock_unchecked();
+            guard
+                .as_ref()
+                .map(|recorder| working_set::selection_sidecar_path(&recorder.get_rollout_path()))
+        };
+        let Some(path) = sidecar_path else {
+            return;
+        };
+        let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+            return;
+        };
+        let mut restored: Option<String> = None;
+        for line in contents.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let candidate = match value.get("record").and_then(|record| record.as_str()) {
+                Some("turn") => value.get("epoch_id").and_then(|id| id.as_str()),
+                Some("selection") => value
+                    .get("manifest")
+                    .and_then(|manifest| manifest.get("epoch"))
+                    .and_then(|epoch| epoch.get("epoch_id"))
+                    .and_then(|id| id.as_str()),
+                _ => None,
+            };
+            // A file is append-only, so the last usable record wins.
+            if let Some(id) = candidate {
+                restored = Some(id.to_string());
+            }
+        }
+        if let Some(epoch_id) = restored {
+            let mut state = self.state.lock_unchecked();
+            if state.last_working_set_epoch.is_none() {
+                state.last_working_set_epoch = Some(epoch_id);
+            }
         }
     }
 
