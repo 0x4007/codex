@@ -59,5 +59,9 @@ async fn list_collaboration_modes_returns_presets() -> Result<()> {
         })
         .collect();
     assert_eq!(expected, items);
+    assert!(
+        items.iter().all(|preset| preset.reasoning_effort.is_none()),
+        "mode discovery must preserve the client's selected effort"
+    );
     Ok(())
 }

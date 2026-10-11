@@ -306,10 +306,11 @@ async fn reasoning_selection_in_plan_mode_matching_plan_effort_but_different_glo
     let _ = drain_insert_history(&mut rx);
     set_chatgpt_auth(&mut chat);
 
-    // Reproduce: Plan effective reasoning remains the preset (medium), but the
+    // Reproduce: Plan effective reasoning remains the override (medium), but the
     // global default differs (high). Pressing Enter on the current Plan choice
     // should open the scope prompt rather than silently rewriting the global default.
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
 
     let preset = get_available_model(&chat, "gpt-5.5");
     chat.open_reasoning_popup(preset);
@@ -335,6 +336,7 @@ async fn reasoning_shortcut_in_plan_mode_updates_plan_override_without_prompt_or
     chat.set_collaboration_mask(plan_mask);
     let _ = drain_insert_history(&mut rx);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT));
 
@@ -652,7 +654,7 @@ async fn plan_reasoning_scope_popup_mentions_selected_reasoning() {
 }
 
 #[tokio::test]
-async fn plan_reasoning_scope_popup_mentions_built_in_plan_default_when_no_override() {
+async fn plan_reasoning_scope_popup_mentions_global_default_when_no_override() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.open_plan_reasoning_scope_prompt(
         "gpt-5.5".to_string(),
@@ -664,7 +666,7 @@ async fn plan_reasoning_scope_popup_mentions_built_in_plan_default_when_no_overr
         popup
             .split_whitespace()
             .collect::<String>()
-            .contains("built-inPlandefault(medium)")
+            .contains("globaldefaultreasoninglevel")
     );
 }
 
@@ -1361,7 +1363,7 @@ async fn mode_switch_surfaces_model_change_notification_when_effective_model_cha
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        plan_messages.contains("Model changed to gpt-5.6-luna medium for Plan mode."),
+        plan_messages.contains("Model changed to gpt-5.6-luna default for Plan mode."),
         "expected Plan-mode model switch notice, got: {plan_messages:?}"
     );
 
@@ -1387,6 +1389,7 @@ async fn mode_switch_surfaces_reasoning_change_notification_when_model_stays_sam
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.6-terra")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
 
     let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
         .expect("expected plan collaboration mode");
@@ -1657,19 +1660,22 @@ async fn set_model_updates_active_collaboration_mask() {
 }
 
 #[tokio::test]
-async fn set_reasoning_effort_updates_active_collaboration_mask() {
+async fn set_reasoning_effort_updates_plan_without_an_override() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.6-terra")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
         .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.set_reasoning_effort(/*effort*/ None);
-
-    assert_eq!(
-        chat.current_reasoning_effort(),
-        Some(ReasoningEffortConfig::Medium)
-    );
+    for effort in [
+        Some(ReasoningEffortConfig::Max),
+        Some(ReasoningEffortConfig::High),
+        Some(ReasoningEffortConfig::Low),
+        None,
+    ] {
+        chat.set_reasoning_effort(effort.clone());
+        assert_eq!(chat.current_reasoning_effort(), effort);
+    }
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
 }
 

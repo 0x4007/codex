@@ -4114,7 +4114,7 @@ async fn status_line_reasoning_updates_on_mode_switch_without_manual_refresh() {
         .expect("expected plan collaboration mode");
     chat.set_collaboration_mask(plan_mask);
 
-    assert_eq!(status_line_text(&chat), Some("medium".to_string()));
+    assert_eq!(status_line_text(&chat), Some("high".to_string()));
 }
 
 #[tokio::test]
@@ -4130,7 +4130,7 @@ async fn status_line_model_with_reasoning_updates_on_mode_switch_without_manual_
         .expect("expected plan collaboration mode");
     chat.set_collaboration_mask(plan_mask);
 
-    assert_eq!(status_line_text(&chat), Some("gpt-5.2 medium".to_string()));
+    assert_eq!(status_line_text(&chat), Some("gpt-5.2 high".to_string()));
 
     let default_mask = collaboration_modes::default_mask(chat.model_catalog.as_ref())
         .expect("expected default collaboration mode");

@@ -1,7 +1,6 @@
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::openai_models::ReasoningEffort;
 
 pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
     let messages = ResolvedModelMessages::bundled().collaboration_modes();
@@ -10,7 +9,8 @@ pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
             name: ModeKind::Plan.display_name().to_string(),
             mode: Some(ModeKind::Plan),
             model: None,
-            reasoning_effort: Some(Some(ReasoningEffort::Medium)),
+            // Preserve the selected effort when entering Plan mode.
+            reasoning_effort: None,
             developer_instructions: Some(Some(messages.plan.text().to_string())),
         },
         CollaborationModeMask {
